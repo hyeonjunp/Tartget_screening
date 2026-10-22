@@ -1,0 +1,21 @@
+.target-screening-envs/
+.tools/
+.mamba/
+RxnFlow/.conda/
+RxnFlow/.pkgs/
+RxnFlow/data/building_blocks/
+RxnFlow/data/envs/zincfrag/
+RxnFlow/weights/
+workspaces/
+__pycache__/
+*.py[cod]
+
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+# Large pretrained checkpoints are downloaded from Hugging Face at first use
+vendor/DTA_model/result/
+vendor/PLM/checkpoint_step500000.pt
+vendor/Autodock/
+RxnFlow/experiments/data/envs/zincfrag/

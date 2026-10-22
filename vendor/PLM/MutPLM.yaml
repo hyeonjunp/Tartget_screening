@@ -1,0 +1,44 @@
+# ========================
+# Data
+# ========================
+wt_fasta: ../Human_FASTA/WT_FASTA.fasta
+mut_fasta: ../Human_FASTA/variation_FASTA.fasta
+val_wt_fasta: ../Human_FASTA/valid_WT_FASTA.fasta
+val_mut_fasta: ../Human_FASTA/valid_variation_FASTA.fasta
+distance_csv: six_aa_pairwise_distance.csv
+
+batch_size: 16
+num_workers: 8
+valid_batch_size: 256
+
+# ========================
+# Training
+# ========================
+lr: 4e-4
+warmup_steps: 2000
+training_steps: 500000
+
+phase1_steps: 50000      # WT512 : Mut512 = 1 : 3
+phase2_steps: 450000      # 2 : 2 : 6 : 6
+
+eval_interval: 10000
+resume: true
+
+# ========================
+# Model
+# ========================
+model:
+  embed_dim: 1024
+  num_layers: 16
+  num_heads: 16
+  ffn_embed_dim: 4096
+  dropout: 0.1
+
+# ========================
+# Output
+# ========================
+run_name: MutPLM
+save_dir: checkpoints
+######
+# START
+# CUDA_VISIBLE_DEVICES=1 python int_sincos_model/pretrain.py --config configs/int_sincos_Head_Layer_16.yaml
