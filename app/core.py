@@ -67,6 +67,9 @@ def save_fasta_pair(directory: str | Path, identifier: str, sequence: str, notat
     return wt_path, mutant_path
 
 
+STRICT_FOLD_CHECKS_EACH_VALUE = True
+
+
 def fold_decision(candidate: list[float | None], reference: list[float | None],
                   selection_method: str = "strict") -> dict[str, Any]:
     """Compare five-fold DTA predictions using strict-range or mean separation."""
@@ -90,12 +93,12 @@ def fold_decision(candidate: list[float | None], reference: list[float | None],
     cmean, rmean = sum(cvals) / 5, sum(rvals) / 5
     if selection_method == "mean":
         delta = cmean - rmean
-        passed = delta > 0
+        passed = cmean > rmean
         reason = "Candidate mean exceeds reference mean." if passed else "Candidate mean is not greater than reference mean."
     else:
         delta = cmin - rmax
-        passed = delta > 0
-        reason = "Candidate minimum exceeds reference maximum." if passed else "Candidate minimum is not strictly greater than reference maximum."
+        passed = all(value > rmax for value in cvals)
+        reason = "All candidate folds exceed the reference maximum." if passed else "Every candidate fold must be strictly greater than the reference maximum."
     result.update(status="passed" if passed else "rejected", candidate_min=cmin,
                    candidate_max=cmax, reference_min=rmin, reference_max=rmax,
                    candidate_mean=cmean, reference_mean=rmean,

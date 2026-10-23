@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import sys
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -17,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 import importlib
 import app.core as core
 if (not hasattr(core, "parse_target_drug_query") or
-        "selection_method" not in core.fold_decision.__code__.co_varnames):
+        "selection_method" not in core.fold_decision.__code__.co_varnames or
+        not getattr(core, "STRICT_FOLD_CHECKS_EACH_VALUE", False)):
     importlib.reload(core)
 from app.core import apply_mutations, environment_report, fetch_uniprot_fasta, parse_target_drug_query, parse_target_query, search_pdb, sequence_identity
 import app.workflow as workflow
@@ -270,12 +273,12 @@ model_set = st.radio("DTA dataset / measurement", ["DAVIS", "ChEMBL IC50", "ChEM
 status = stage_status(model_set)
 st.caption("선택한 DTA 모델의 5개 fold 체크포인트 상태를 확인했습니다." if status["configured"] else "선택한 DTA 모델 체크포인트가 준비되지 않았습니다.")
 st.caption("ChEMBL IC50, Ki and Kd use separate 5-fold models. Do not compare predictions across measurement types.")
-selection_label = st.radio("후보 선별 기준", [
+selection_options = [
     "엄격 기준: 후보 fold 최솟값 > 기준 약물 fold 최댓값",
     "평균 기준: 후보 fold 평균 > 기준 약물 fold 평균",
-], horizontal=True, key="dta_selection_label")
+]
+selection_label = st.session_state.get("dta_selection_label", selection_options[0])
 selection_method = "mean" if selection_label.startswith("평균") else "strict"
-st.caption("선택한 기준을 초과한 후보만 도킹 단계로 전달됩니다. 모든 fold 예측값이 있어야 선별할 수 있습니다.")
 if st.session_state.get("uniprot"):
     st.subheader("선택 서열로 5-fold 예측 (SMILES 직접 입력)")
     generated_path = Path(st.session_state.get("job", "")) / "generated_candidates.csv"
@@ -300,7 +303,7 @@ if st.session_state.get("uniprot"):
             screened = [{**rows[0], "candidate_id": reference_name, "fold_mean": sum(reference_folds) / 5,
                          "ID": reference_id, "drug_name": reference_name, "status": "reference"}]
             for i, row in enumerate(rows[1:]):
-                decision = fold_decision([row[f"fold{fold}"] for fold in range(1, 6)], reference_folds)
+                decision = fold_decision([row[f"fold{fold}"] for fold in range(1, 6)], reference_folds, selection_method)
                 source = generated_rows[i]
                 candidate_id = source.get("ID") or source.get("candidate_id") or f"candidate_{i+1}"
                 screened.append({**source, **row, "candidate_id": candidate_id, "fold_mean": sum(row[f"fold{fold}"] for fold in range(1, 6)) / 5,
@@ -329,7 +332,16 @@ if st.session_state.get("dta_rows") is not None:
         reference_row["status"] = "reference"
         for row in screened[1:]:
             candidate_folds = [row.get(f"fold{i}") for i in range(1, 6)]
-            row.update(fold_decision(candidate_folds, reference_folds, selection_method))
+            decision = fold_decision(candidate_folds, reference_folds, selection_method)
+            row.update(decision)
+            row["판정"] = "통과" if decision["status"] == "passed" else "제외" if decision["status"] == "rejected" else "예측 실패"
+            if decision["status"] == "passed" or decision["status"] == "rejected":
+                if selection_method == "strict":
+                    row["선별 비교"] = f"최솟값 {decision['candidate_min']:.3f} > 기준 최댓값 {decision['reference_max']:.3f}"
+                else:
+                    row["선별 비교"] = f"평균 {decision['candidate_mean']:.3f} > 기준 평균 {decision['reference_mean']:.3f}"
+            else:
+                row["선별 비교"] = decision.get("reason", "5-fold 예측 필요")
             try:
                 row["fold_mean"] = sum(float(value) for value in candidate_folds) / 5
             except (TypeError, ValueError):
@@ -348,18 +360,26 @@ if st.session_state.get("dta_rows") is not None:
         def score_cell_styles(row):
             styles = []
             for column in row.index:
-                if column == "status" and row.get("status") == "reference":
-                    styles.append("background-color: #dbeafe; font-weight: bold")
+                if column in {"status", "판정"}:
+                    if row.get("status") == "reference":
+                        styles.append("background-color: #dbeafe; font-weight: bold")
+                    elif row.get("status") == "passed":
+                        styles.append("background-color: #c6efce; color: #006100; font-weight: bold")
+                    elif row.get("status") == "rejected":
+                        styles.append("background-color: #fce4d6; color: #9c0006")
+                    else:
+                        styles.append("")
                 elif column in [f"fold{i}" for i in range(1, 6)]:
                     if row.get("status") == "reference":
                         styles.append("background-color: #dbeafe; font-weight: bold")
-                    else:
-                        fold_index = int(column[4:]) - 1
+                    elif selection_method == "strict":
                         try:
-                            styles.append("background-color: #c6efce; color: #006100" if float(row[column]) > reference_folds[fold_index] else "")
+                            styles.append("background-color: #c6efce; color: #006100" if float(row[column]) > max(reference_folds) else "")
                         except (TypeError, ValueError):
                             styles.append("")
-                elif column == "fold_mean":
+                    else:
+                        styles.append("")
+                elif column == "fold_mean" and selection_method == "mean":
                     try:
                         styles.append("background-color: #c6efce; color: #006100; font-weight: bold" if float(row[column]) > reference_mean else "")
                     except (TypeError, ValueError):
@@ -379,6 +399,12 @@ if st.session_state.get("dta_rows") is not None:
         st.caption("초록색 셀은 같은 fold의 기준 약물 점수 또는 기준 약물 평균보다 높은 값입니다. 표에는 기준 약물과 평균 상위 100개 후보를 표시합니다.")
         st.dataframe(preview_df.style.apply(score_cell_styles, axis=1).format(precision=3, na_rep="—"),
                      use_container_width=True, height=520)
+        st.subheader("후보 선별")
+        selection_label = st.radio(
+            "선별 기준", selection_options, horizontal=True, key="dta_selection_label",
+        )
+        selection_method = "mean" if selection_label.startswith("평균") else "strict"
+        st.caption("현재 선택 기준으로 판정을 갱신했습니다. 엄격 기준에서는 모든 후보 fold가 기준 약물의 최고 fold보다 높아야 통과합니다. 평균 기준에서는 후보 평균이 기준 약물 평균보다 높아야 통과합니다.")
 
         if candidates_by_mean:
             chart_candidates = [row for row in candidates_by_mean if row.get("status") == "passed"] or candidates_by_mean
@@ -391,36 +417,173 @@ if st.session_state.get("dta_rows") is not None:
                                     float(selected_row["fold_mean"])],
             }, index=["Fold 1", "Fold 2", "Fold 3", "Fold 4", "Fold 5", "평균"])
             st.line_chart(chart_data, y_label="DTA 예측값", height=320)
+
+            smiles = str(selected_row.get("SMILES") or selected_row.get("smiles") or "")
+            candidate_status = {"passed": "선별 통과", "rejected": "선별 제외", "prediction_failed": "예측 실패"}.get(selected_row.get("status"), "상태 미확인")
+            st.markdown(f"**선택 후보:** {selected_row.get('drug_name') or selected_chart_id} · {candidate_status}")
+            if smiles:
+                try:
+                    from rdkit import Chem
+                    from rdkit.Chem import Crippen, Descriptors, Draw, rdMolDescriptors
+
+                    molecule = Chem.MolFromSmiles(smiles)
+                    if molecule is None:
+                        st.warning("선택 후보의 SMILES를 읽을 수 없어 2D 구조를 표시하지 못했습니다.")
+                    else:
+                        structure_col, info_col = st.columns([1, 2])
+                        with structure_col:
+                            st.image(Draw.MolToImage(molecule, size=(480, 360)), caption="선택 후보 2D 구조", use_container_width=True)
+                        with info_col:
+                            st.code(smiles, language=None)
+                            prop_cols = st.columns(4)
+                            prop_cols[0].metric("분자량", f"{Descriptors.MolWt(molecule):.1f} Da")
+                            prop_cols[1].metric("cLogP", f"{Crippen.MolLogP(molecule):.2f}")
+                            prop_cols[2].metric("TPSA", f"{rdMolDescriptors.CalcTPSA(molecule):.1f} Å²")
+                            prop_cols[3].metric("HBD / HBA", f"{rdMolDescriptors.CalcNumHBD(molecule)} / {rdMolDescriptors.CalcNumHBA(molecule)}")
+
+                        fold_info = pd.DataFrame({
+                            "Fold": [f"Fold {i}" for i in range(1, 6)] + ["평균"],
+                            "기준 약물": [*reference_folds, reference_mean],
+                            "선택 후보": [*(float(selected_row[f"fold{i}"]) for i in range(1, 6)), float(selected_row["fold_mean"])],
+                        })
+                        st.dataframe(fold_info.style.format({"기준 약물": "{:.3f}", "선택 후보": "{:.3f}"}),
+                                     hide_index=True, use_container_width=True)
+                except ImportError:
+                    st.info("RDKit이 없어 2D 구조와 분자 특성을 표시할 수 없습니다.")
         st.caption(st.session_state.dta_note)
         st.write(f"CSV: {st.session_state.dta_csv}")
+
 st.header("5. DTA 통과 후보 SDF 변환 및 도킹")
 job_text = st.session_state.get("job")
 passed_csv = st.session_state.get("dta_passed_csv")
 if passed_csv and Path(passed_csv).is_file():
     accepted = pd.read_csv(passed_csv)
-    st.caption(f"PDB 결합 약물은 native reference로 사용합니다. DTA 통과 후보 {len(accepted)}개를 도킹합니다.")
+    st.caption(f"PDB에서 선택한 기준 약물과 DTA 통과 후보 {len(accepted)}개를 같은 조건으로 도킹합니다.")
     if not accepted.empty and st.button("3단계: 통과 후보만 SDF 변환 및 Vina 도킹", type="primary"):
         try:
             job = Path(job_text)
             manifest = json.loads((job / "manifest.json").read_text(encoding="utf-8"))
             center, box_size = manifest.get("docking_center"), manifest.get("docking_box_size", [20, 20, 20])
+            reference_row = (st.session_state.get("dta_rows") or [{}])[0]
+            reference_smiles = str(reference_row.get("SMILES") or reference_row.get("smiles") or "").strip()
+            if not reference_smiles:
+                raise ValueError("기준 약물 SMILES가 없어 기준 약물 도킹을 추가할 수 없습니다.")
+            docking_input = job / "docking_input_candidates.csv"
+            docking_rows = [{
+                "ID": reference_row.get("ID") or "reference_drug",
+                "drug_name": reference_row.get("drug_name") or "기준 약물",
+                "SMILES": reference_smiles,
+            }, *accepted.to_dict(orient="records")]
+            pd.DataFrame(docking_rows, columns=["ID", "drug_name", "SMILES"]).to_csv(docking_input, index=False)
             dock_cmd = [vina_exec, str(ROOT / "app" / "vina_pipeline.py"), "dock",
-                "--receptor", str(job / "receptor" / "receptor.pdbqt"), "--candidates", passed_csv,
+                "--receptor", str(job / "receptor" / "receptor.pdbqt"), "--candidates", str(docking_input),
                 "--out-dir", str(job), "--center", *map(str, center), "--box-size", *map(str, box_size)]
-            with st.spinner("선별 후보를 SDF로 변환하고 Vina 도킹 중..."):
+            with st.spinner("기준 약물과 DTA 통과 후보를 같은 조건으로 Vina 도킹 중..."):
                 docked = run_command(dock_cmd, ROOT, timeout=24 * 3600)
             if not docked["ok"]:
                 raise RuntimeError(docked["stderr"][-4000:] or docked["stdout"][-4000:])
             dock_info = json.loads(docked["stdout"].splitlines()[-1])
             stages = dict(manifest.get("stages", {}))
             stages["vina_docking"] = "complete"
-            update_manifest(job, docking_scores=str(Path(dock_info["summary"]).relative_to(job)),
+            update_manifest(job, docking_input_candidates=str(docking_input.relative_to(job)),
+                docking_scores=str(Path(dock_info["summary"]).relative_to(job)),
                 docking_poses=str(Path(dock_info["poses"]).relative_to(job)), stages=stages)
             st.success(f"도킹 완료: {dock_info['docked']}/{dock_info['rows']}개 성공")
         except Exception as exc:
             st.error(f"SDF 변환/Vina 도킹 실패: {exc}")
 elif st.session_state.get("dta_rows") is not None:
     st.info("DTA 통과 후보가 없어 도킹을 진행하지 않습니다.")
-if job_text and (Path(job_text) / "docking_scores.csv").is_file():
-    dock_rows = pd.read_csv(Path(job_text) / "docking_scores.csv")
-    st.dataframe(dock_rows.sort_values("Vina", na_position="last"), use_container_width=True)
+if job_text:
+    job = Path(job_text)
+    receptor_dir = job / "receptor"
+    receptor_pdb = receptor_dir / "receptor.pdb"
+    receptor_pdbqt = receptor_dir / "receptor.pdbqt"
+    if receptor_pdb.is_file() or receptor_pdbqt.is_file():
+        st.subheader("구조 파일 다운로드")
+        st.caption("원본 PDB에서 분석 체인의 단백질만 남긴 수용체 파일과, 도킹에 사용한 PDBQT를 다운로드할 수 있습니다.")
+        protein_cols = st.columns(2)
+        manifest = json.loads((job / "manifest.json").read_text(encoding="utf-8"))
+        structure_tag = f"{manifest.get('pdb_id', 'structure')}_chain_{manifest.get('chain', 'A')}"
+        if receptor_pdb.is_file():
+            protein_cols[0].download_button("단백질만 추출한 PDB 다운로드", receptor_pdb.read_bytes(),
+                file_name=f"{structure_tag}_protein.pdb", mime="chemical/x-pdb", key="download_protein_pdb")
+        if receptor_pdbqt.is_file():
+            protein_cols[1].download_button("수용체 PDBQT 다운로드", receptor_pdbqt.read_bytes(),
+                file_name=f"{structure_tag}_receptor.pdbqt", mime="chemical/x-pdbqt", key="download_protein_pdbqt")
+
+    if (job / "docking_scores.csv").is_file():
+        dock_rows = pd.read_csv(job / "docking_scores.csv")
+        reference_row = (st.session_state.get("dta_rows") or [{}])[0]
+        reference_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(reference_row.get("ID") or "reference_drug"))
+        reference_dock = dock_rows[dock_rows["ID"].astype(str) == reference_id]
+        reference_score = None
+        if not reference_dock.empty:
+            reference_result = reference_dock.iloc[0]
+            try:
+                if reference_result.get("status") != "docked":
+                    raise ValueError("기준 약물 도킹이 성공하지 않았습니다.")
+                reference_score = float(reference_result["Vina"])
+                if pd.isna(reference_score):
+                    raise ValueError("기준 약물 Vina 점수가 비어 있습니다.")
+                st.metric("기준 약물 Vina 점수", f"{reference_score:.3f} kcal/mol")
+                st.caption(f"기준 약물: {reference_result['drug_name']} · SMILES에서 3D를 생성해 후보와 같은 조건으로 재도킹한 값입니다. Vina 점수는 더 낮을수록 유리합니다.")
+            except (TypeError, ValueError):
+                st.warning(f"기준 약물 도킹 실패: {reference_result.get('status', '원인 미상')}")
+        else:
+            st.info("현재 표시된 기존 도킹 결과에는 기준 약물 점수가 없습니다. 위 버튼을 다시 실행하면 기준 약물도 함께 도킹합니다.")
+        candidate_docks = dock_rows[dock_rows["ID"].astype(str) != reference_id]
+        st.dataframe(candidate_docks.sort_values("Vina", na_position="last"), use_container_width=True)
+        if reference_score is not None:
+            candidate_docks = candidate_docks.copy()
+            candidate_docks["_vina_numeric"] = pd.to_numeric(candidate_docks["Vina"], errors="coerce")
+            better_docks = candidate_docks[
+                (candidate_docks.get("status") == "docked") & (candidate_docks["_vina_numeric"] < reference_score)
+            ]
+            st.caption(f"Vina가 기준 약물보다 유리한 후보: {len(better_docks)}개 · 기준보다 더 낮은(더 음수인) 점수만 묶음에 포함합니다.")
+            if not better_docks.empty:
+                archive_buffer = io.BytesIO()
+                archive_root = "target_screening_docking_bundle"
+                with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    for file_path, archive_name in [
+                        (receptor_pdb, f"{archive_root}/receptor/protein_only.pdb"),
+                        (receptor_pdbqt, f"{archive_root}/receptor/receptor.pdbqt"),
+                        (job / "ligands" / f"{reference_id}.pdbqt", f"{archive_root}/reference/{reference_id}.pdbqt"),
+                        (job / "docking_poses" / f"{reference_id}_docked.pdbqt", f"{archive_root}/reference/{reference_id}_docked.pdbqt"),
+                    ]:
+                        if file_path.is_file():
+                            archive.write(file_path, archive_name)
+                    for _, dock_row in better_docks.iterrows():
+                        candidate_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(dock_row["ID"]))
+                        for file_path, archive_name in [
+                            (job / "ligands" / f"{candidate_id}.pdbqt", f"{archive_root}/better_candidates/{candidate_id}.pdbqt"),
+                            (job / "docking_poses" / f"{candidate_id}_docked.pdbqt", f"{archive_root}/better_candidates/{candidate_id}_docked.pdbqt"),
+                        ]:
+                            if file_path.is_file():
+                                archive.write(file_path, archive_name)
+                    summary_rows = pd.concat([reference_dock, better_docks.drop(columns=["_vina_numeric"])], ignore_index=True)
+                    archive.writestr(f"{archive_root}/reference_and_better_scores.csv", summary_rows.to_csv(index=False))
+                archive_buffer.seek(0)
+                st.download_button(
+                    f"기준 약물 + 우수 후보 {len(better_docks)}개 ZIP 다운로드",
+                    archive_buffer.getvalue(),
+                    file_name="target_screening_reference_and_better_candidates.zip",
+                    mime="application/zip", key="download_better_than_reference_bundle",
+                )
+            else:
+                st.info("기준 약물보다 Vina 점수가 더 낮은 성공 후보가 없습니다.")
+        ligand_dir = job / "ligands"
+        ligand_files = sorted(ligand_dir.glob("*.pdbqt"))
+        if ligand_files:
+            st.markdown("**약물 PDBQT 다운로드**")
+            selected_ligand_name = st.selectbox(
+                "다운로드할 약물", [path.name for path in ligand_files],
+                format_func=lambda name: Path(name).stem, key="download_ligand_pdbqt_choice"
+            )
+            selected_ligand_file = ligand_dir / selected_ligand_name
+            ligand_col, pose_col = st.columns(2)
+            ligand_col.download_button("선택 약물 PDBQT 다운로드", selected_ligand_file.read_bytes(),
+                file_name=selected_ligand_file.name, mime="chemical/x-pdbqt", key="download_candidate_ligand_pdbqt")
+            pose_file = job / "docking_poses" / f"{selected_ligand_file.stem}_docked.pdbqt"
+            if pose_file.is_file():
+                pose_col.download_button("선택 약물 도킹 포즈 PDBQT 다운로드", pose_file.read_bytes(),
+                    file_name=pose_file.name, mime="chemical/x-pdbqt", key="download_candidate_pose_pdbqt")
